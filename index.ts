@@ -138,7 +138,7 @@ function loadConfig(): AutoRenameConfig {
           debug: typeof raw.debug === "boolean" ? raw.debug : DEFAULT_CONFIG.debug,
           lang: resolveLang(raw.lang),
           aiTimeoutMs: typeof raw.aiTimeoutMs === "number" && raw.aiTimeoutMs >= 1_000 ? raw.aiTimeoutMs : DEFAULT_CONFIG.aiTimeoutMs,
-          maxAttempts: typeof raw.maxAttempts === "number" && raw.maxAttempts >= 1 && raw.maxAttempts <= 10 ? raw.maxAttempts : DEFAULT_CONFIG.maxAttempts,
+          maxAttempts: typeof raw.maxAttempts === "number" && raw.maxAttempts >= 1 ? raw.maxAttempts : DEFAULT_CONFIG.maxAttempts,
           backoffMs: typeof raw.backoffMs === "number" && raw.backoffMs >= 100 ? raw.backoffMs : DEFAULT_CONFIG.backoffMs,
         };
         configMtime = mtime;
