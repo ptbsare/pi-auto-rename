@@ -89,6 +89,9 @@ interface AutoRenameConfig {
   maxCoreWidth: number;     // core-goal cap in display columns (CJK counts 2)
   debug: boolean;
   lang: TitleLang;          // forced title language (issue #3)
+  aiTimeoutMs: number;      // per-attempt LLM call timeout in ms
+  maxAttempts: number;      // total max LLM calls (including first + correction retry)
+  backoffMs: number;        // base backoff duration in ms between retries
 }
 
 const DEFAULT_CONFIG: AutoRenameConfig = {
@@ -99,11 +102,12 @@ const DEFAULT_CONFIG: AutoRenameConfig = {
   maxCoreWidth: MAX_CORE_WIDTH,
   debug: false,
   lang: "auto",
+  aiTimeoutMs: 12_000,        // per-attempt LLM call timeout
+  maxAttempts: 3,              // total LLM calls allowed (1st + retries + 1 correction)
+  backoffMs: 500,              // base backoff; doubles each retry (500ms, 1s, 2s…)
 };
 
 const MAX_NAME_TOKENS = 1024;   // generous: thinking-mode models burn tokens on reasoning
-const AI_TOTAL_BUDGET_MS = 30_000;
-const AI_ATTEMPT_TIMEOUT_MS = 12_000;
 const STATE_ENTRY_TYPE = "auto-rename-state";
 
 let debugEnabled = false;
@@ -133,6 +137,9 @@ function loadConfig(): AutoRenameConfig {
           maxCoreWidth: typeof raw.maxCoreWidth === "number" && raw.maxCoreWidth >= 8 ? raw.maxCoreWidth : DEFAULT_CONFIG.maxCoreWidth,
           debug: typeof raw.debug === "boolean" ? raw.debug : DEFAULT_CONFIG.debug,
           lang: resolveLang(raw.lang),
+          aiTimeoutMs: typeof raw.aiTimeoutMs === "number" && raw.aiTimeoutMs >= 1_000 ? raw.aiTimeoutMs : DEFAULT_CONFIG.aiTimeoutMs,
+          maxAttempts: typeof raw.maxAttempts === "number" && raw.maxAttempts >= 1 && raw.maxAttempts <= 5 ? raw.maxAttempts : DEFAULT_CONFIG.maxAttempts,
+          backoffMs: typeof raw.backoffMs === "number" && raw.backoffMs >= 100 ? raw.backoffMs : DEFAULT_CONFIG.backoffMs,
         };
         configMtime = mtime;
       }
@@ -171,6 +178,9 @@ interface LlmRuntime {
   apiKey: string;
   headers?: Record<string, string>;
   env?: Record<string, string>;
+  timeoutMs: number;
+  maxAttempts: number;
+  backoffMs: number;
 }
 
 function extractText(response: any): string {
@@ -193,9 +203,13 @@ function extractText(response: any): string {
 
 async function llmOnce(rt: LlmRuntime, userContent: string, correctionHint?: string, signal?: AbortSignal, systemPrompt: string = systemPromptFor(false, "auto")): Promise<string> {
   const messages: any[] = [{ role: "user", content: [{ type: "text", text: userContent }], timestamp: Date.now() }];
-  const call = async (msgs: any[]): Promise<string> => {
+  const timeoutMs = rt.timeoutMs ?? 12_000;
+  const maxAttempts = rt.maxAttempts ?? 3;
+  const backoffMs = rt.backoffMs ?? 500;
+
+  const doCall = async (msgs: any[]): Promise<string> => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error("llm attempt timed out")), AI_ATTEMPT_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(new Error("llm attempt timed out")), timeoutMs);
     const onOuter = () => controller.abort(signal?.reason);
     if (signal?.aborted) controller.abort(signal.reason);
     else signal?.addEventListener("abort", onOuter, { once: true });
@@ -217,19 +231,37 @@ async function llmOnce(rt: LlmRuntime, userContent: string, correctionHint?: str
     }
   };
 
-  let out = "";
-  try { out = await call(messages); } catch (e) { debugLog(`llm failed: ${e instanceof Error ? e.message : String(e)}`); }
-  if (!out) { // transient error -> one retry
-    try { out = await call(messages); } catch { /* give up below */ }
-  }
-  if (out && !looksLikeResponse(out)) return out;
-  if (out && correctionHint) {
-    debugLog(`output looks like a response (${out.slice(0, 60)}); corrective retry`);
-    messages.push({ role: "user", content: [{ type: "text", text: correctionHint }], timestamp: Date.now() });
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  let usedCorrection = false;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    if (i > 0) {
+      const wait = backoffMs * Math.pow(2, i - 1);
+      debugLog(`retry attempt ${i + 1}/${maxAttempts}, waiting ${wait}ms`);
+      await sleep(wait);
+    }
+
+    let out = "";
     try {
-      const out2 = await call(messages);
-      if (out2 && !looksLikeResponse(out2)) return out2;
-    } catch { /* fall through */ }
+      out = await doCall(messages);
+    } catch (e) {
+      debugLog(`attempt ${i + 1} failed: ${e instanceof Error ? e.message : String(e)}`);
+      if (i === maxAttempts - 1) return "";
+      continue;
+    }
+
+    if (!out) continue; // empty response (e.g., truncated), retry
+    if (!looksLikeResponse(out)) return out; // success
+
+    // Output looks like a sentence/response — try once with correction hint
+    if (correctionHint && !usedCorrection) {
+      usedCorrection = true;
+      debugLog(`output looks like a response (${out.slice(0, 60)}); corrective retry`);
+      messages.push({ role: "user", content: [{ type: "text", text: correctionHint }], timestamp: Date.now() });
+      continue; // for-loop advances i; this counts as the next attempt
+    }
+
+    return ""; // format wrong and no correction left
   }
   return "";
 }
@@ -325,7 +357,7 @@ async function buildLlmRuntime(ctx: ExtensionContext): Promise<LlmRuntime | null
     try {
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
       if (auth.ok && auth.apiKey) {
-        return { ctx, model, apiKey: auth.apiKey, headers: auth.headers, env: auth.env };
+        return { ctx, model, apiKey: auth.apiKey, headers: auth.headers, env: auth.env, timeoutMs: config.aiTimeoutMs, maxAttempts: config.maxAttempts, backoffMs: config.backoffMs };
       }
     } catch (e) {
       debugLog(`auth for ${model?.provider}/${model?.id} failed: ${e instanceof Error ? e.message : String(e)}`);
