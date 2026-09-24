@@ -132,8 +132,8 @@ function loadConfig(): AutoRenameConfig {
         configCache = {
           enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_CONFIG.enabled,
           model: typeof raw.model === "string" && raw.model.trim() ? raw.model.trim() : DEFAULT_CONFIG.model,
-          firstAfterMin: typeof raw.firstAfterMin === "number" && raw.firstAfterMin >= 1 ? raw.firstAfterMin : DEFAULT_CONFIG.firstAfterMin,
-          repeatEveryMin: typeof raw.repeatEveryMin === "number" && raw.repeatEveryMin >= 1 ? raw.repeatEveryMin : DEFAULT_CONFIG.repeatEveryMin,
+          firstAfterMin: typeof raw.firstAfterMin === "number" && raw.firstAfterMin >= 0 ? raw.firstAfterMin : DEFAULT_CONFIG.firstAfterMin,
+          repeatEveryMin: typeof raw.repeatEveryMin === "number" && raw.repeatEveryMin >= 0 ? raw.repeatEveryMin : DEFAULT_CONFIG.repeatEveryMin,
           maxCoreWidth: typeof raw.maxCoreWidth === "number" && raw.maxCoreWidth >= 8 ? raw.maxCoreWidth : DEFAULT_CONFIG.maxCoreWidth,
           debug: typeof raw.debug === "boolean" ? raw.debug : DEFAULT_CONFIG.debug,
           lang: resolveLang(raw.lang),
