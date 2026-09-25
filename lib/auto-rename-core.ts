@@ -56,6 +56,56 @@ export function scanUserMessages(branch: any[]): string[] {
   return msgs;
 }
 
+// ---- full conversation (per-cycle re-derivation) ----------------------------
+
+const CONV_MSG_CHAR_CAP = 2000;    // truncate each message to this many chars
+const CONV_TOTAL_CHAR_CAP = 20000; // total char budget for the whole conversation
+
+/**
+ * Full user+assistant conversation in transcript order. Used by the periodic
+ * refresh to re-derive the title from EVERYTHING said so far. Very long
+ * sessions keep head + tail (original intent + current focus) and elide the
+ * middle so the prompt stays within budget.
+ */
+export function fullConversation(
+  branch: any[],
+  opts: { maxCharsPerMessage?: number; maxTotalChars?: number } = {},
+): string {
+  const perMsg = opts.maxCharsPerMessage ?? CONV_MSG_CHAR_CAP;
+  const total = opts.maxTotalChars ?? CONV_TOTAL_CHAR_CAP;
+  const parts: string[] = [];
+  for (const entry of branch) {
+    if (entry?.type !== "message") continue;
+    const role = entry.message?.role;
+    if (role !== "user" && role !== "assistant") continue;
+    const text = blockText(entry.message.content);
+    if (!text) continue;
+    parts.push(`${role === "user" ? "User" : "Assistant"}: ${text.slice(0, perMsg)}`);
+  }
+  if (!parts.length) return "";
+  const joined = parts.join("\n\n");
+  if (joined.length <= total) return joined;
+  const headLen = Math.floor(total * 0.3);
+  const tailLen = total - headLen;
+  return (
+    joined.slice(0, headLen) +
+    `\n\n…(${parts.length} messages total; middle elided to fit the budget)…\n\n` +
+    joined.slice(joined.length - tailLen)
+  );
+}
+
+/** Prompt for per-cycle re-derivation: the model sees the full conversation. */
+export function buildConversationPrompt(lang: TitleLang, conversation: string): string {
+  return (
+    "Generate a short title naming what this session is accomplishing, based on the FULL " +
+    "conversation below. Prefer the concrete subject (module, error, feature, document) " +
+    "over generic verbs. " +
+    USER_PROMPT_LANG_LINE[lang] +
+    "No punctuation, no repo name, no issue/PR numbers, no greetings/role-play.\n\n" +
+    "CONVERSATION:\n" + conversation
+  );
+}
+
 function truncateMsgs(msgs: string[], budget: number): string[] {
   const chunks: string[] = [];
   let total = 0;

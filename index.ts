@@ -22,13 +22,12 @@
  * name, so the core is capped at 24 display columns (12 CJK chars / 24 ASCII).
  *
  * Design (do not break):
- *   * Title anchors on the session's CORE GOAL derived from the ORIGINAL INTENT
- *     (earliest user prompts), not the latest transient action; later pastes
- *     (spec dumps quoted from other sessions) can never crowd the core out.
- *   * The core is locked once established: periodic refreshes reuse prev_core
- *     verbatim (no model call) — the title only changes if re-derived.
- *   * Manual rename protection: an out-of-band name change (≠ last set title)
- *     pauses this session so we never fight the user.
+ *   * Every periodic refresh re-derives the title from the FULL conversation
+ *     (head + tail of the transcript when it is very long), so the title tracks
+ *     what the session is actually doing right now.
+ *   * No lock/anchoring: to stop automatic renaming entirely, use
+ *     /autorename-pause. Manual rename protection: an out-of-band name change
+ *     (≠ last set title) pauses this session so we never fight the user.
  *   * LLM via pi's model registry (deepseek/deepseek-v4-flash by default) —
  *     keys stay in pi's keychain, never read from dotfiles here.
  *   * Best-effort everywhere: never throws into pi's event loop.
@@ -38,7 +37,7 @@
  *
  * Controls:
  *   * ~/.pi/agent/auto-rename.json  {enabled, model, firstAfterMin, repeatEveryMin, maxCoreWidth, debug, lang}
- *   * /autorename          force a rename now (bypasses cooldown, pause, and core lock; re-derives with latest context)
+ *   * /autorename          force a rename now (bypasses cooldown and pause; re-derives from the full conversation)
  *   * /autorename-pause    pause this session
  *   * /autorename-resume   resume this session
  *   * /autorename-status   show current state
@@ -54,14 +53,12 @@ import {
   capTitle,
   composeTitle,
   coreFromTitle,
-  coreIsMetaActivity,
   coreIsNonGoal,
   earlyExcerpt,
   earlySelection,
+  fullConversation,
   formatQualityGateMessage,
   gateAwareOutcome,
-  latestSelection,
-  looksLikeError,
   looksLikeResponse,
   notificationLevelFor,
   parseIso,
@@ -69,7 +66,7 @@ import {
   redact,
   scanUserMessages,
   truncateDisplay,
-  buildUserPrompt,
+  buildConversationPrompt,
   resolveLang,
   systemPromptFor,
   type TitleLang,
@@ -267,17 +264,14 @@ async function llmOnce(rt: LlmRuntime, userContent: string, correctionHint?: str
 }
 
 /**
- * Return the core-goal title, or null on hard failure. When prevCore is set
- * (the session already has an established, locked core) it is returned verbatim
- * with no model call — anchored refreshes are free, and the title only changes
- * if the anchor is dropped and re-derived. On a forced re-derive (/autorename)
- * prevCore is passed empty and recent/prevTitle feed the prompt instead, so the
- * model re-derives with the latest context (issue #1).
+ * Return the core-goal title, or null on hard failure. The model sees the FULL
+ * conversation on every refresh, so the title tracks what the session is
+ * actually doing now. There is no locked/anchored mode: to stop automatic
+ * renaming entirely, use /autorename-pause.
  */
-async function generateCore(rt: LlmRuntime, early: string, prevCore: string, recent = "", prevTitle = "", force = false, lang: TitleLang): Promise<string | null> {
-  if (!early) return null;
-  if (prevCore) return prevCore; // locked; no model call needed
-  const user = buildUserPrompt(force, lang, early, recent, prevTitle);
+async function generateCore(rt: LlmRuntime, conversation: string, force = false, lang: TitleLang): Promise<string | null> {
+  if (!conversation) return null;
+  const user = buildConversationPrompt(lang, conversation);
   const core = await llmOnce(rt, user,
     "Wrong: that was a sentence/response, not a title. Output ONLY a short noun-phrase title, nothing else.",
     undefined, systemPromptFor(force, lang));
@@ -289,7 +283,6 @@ interface AutoRenameState {
   lastRunEpoch?: number;
   lastSetTitle?: string;
   lastCore?: string;
-  coreLocked?: boolean; // issue #10 D4: re-derive on every refresh until locked
   paused?: boolean;
   pausedReason?: string;
 }
@@ -401,66 +394,44 @@ async function runAutoRename(pi: ExtensionAPI, ctx: ExtensionContext, opts: { fo
 
   const userMsgs = scanUserMessages(branch);
   const sel = earlySelection(userMsgs);
-  const early = sel.text;
-  if (!early) return { reason: "no user messages" };
+  if (!sel.substantive) return { reason: "no substantive user messages yet" };
 
-  // anchor = this session's own established core (stable + differentiates
-  // sessions on the same branch). Drop it if it's garbage, a procedural/
-  // non-goal label like "方案确认", or a process label like "Issue list
-  // triage" — the last also self-heals legacy junk anchors on next refresh.
-  const cw = config.maxCoreWidth;
-  let anchor = st.lastCore || coreFromTitle(st.lastSetTitle ?? "");
-  if (anchor && (looksLikeError(anchor) || coreIsNonGoal(anchor) || coreIsMetaActivity(anchor))) {
-    debugLog(`anchor ${anchor} dropped (garbage/non-goal/meta); re-deriving`);
-    anchor = "";
-  }
-
-  const prevCore = anchor ?? "";
-  // The core locks only once derived from substantive intent; before that
-  // every refresh re-derives (cheap) so a junk core self-corrects. A forced
-  // /autorename always unlocks: the model is called again with the latest
-  // context so a drifted title can be regenerated (issue #1).
-  const locked = !opts.force && Boolean(st.coreLocked && prevCore);
+  // The model always sees the FULL conversation, so every periodic refresh
+  // produces a fresh title that reflects what the session is doing right now.
+  const conversation = redact(fullConversation(branch));
+  if (!conversation.trim()) return { reason: "no conversation yet" };
 
   const rt = await buildLlmRuntime(ctx);
   if (!rt) return { reason: "no usable model (registry auth failed)" };
 
-  // redact secrets before anything goes to the model
-  const safeEarly = redact(early);
-  const recent = opts.force ? redact(latestSelection(userMsgs)) : "";
-  const coreRaw = await generateCore(rt, safeEarly, locked ? prevCore : "", recent, opts.force ? redact(prevCore) : "", Boolean(opts.force), config.lang);
+  const coreRaw = await generateCore(rt, conversation, Boolean(opts.force), config.lang);
   if (!coreRaw) return { reason: "llm failed; backed off" }; // keep current title, retry next period
   // Quality gate (issue #5): background runs stay strict (issue #10).
   // A forced /autorename degrades instead of rejecting: the ambiguous
   // meta filter is skipped and non-goal cores are accepted with a
   // warning, so an explicit request always yields a title.
-  const gate = locked ? undefined : qualityGate(coreRaw, Boolean(opts.force));
+  const gate = qualityGate(coreRaw, Boolean(opts.force));
   if (gate && gate.action === "reject") {
     const reason = formatQualityGateMessage(gate, coreRaw);
     debugLog(reason);
     return { reason };
   }
 
-  const core = capTitle(locked && prevCore ? prevCore : coreRaw, MAX_TITLE_WORDS, cw);
+  const core = capTitle(coreRaw, MAX_TITLE_WORDS, config.maxCoreWidth);
   const title = composeTitle(core);
 
-  // Title is stable (core locked). Skip the write when nothing changed so the
-  // title isn't churned every refresh.
-  const newState: AutoRenameState = { ...st, lastRunEpoch: now, lastSetTitle: title, lastCore: core, coreLocked: locked || sel.substantive || opts.force, paused: false, pausedReason: undefined };
+  // Skip the write when the title did not change, so the name isn't churned.
+  const newState: AutoRenameState = { ...st, lastRunEpoch: now, lastSetTitle: title, lastCore: core, paused: false, pausedReason: undefined };
   const changed = title !== st.lastSetTitle;
   if (!changed) {
-    pi.appendEntry(STATE_ENTRY_TYPE, { ...st, lastRunEpoch: now, lastCore: core, coreLocked: locked || sel.substantive || opts.force });
+    pi.appendEntry(STATE_ENTRY_TYPE, { ...st, lastRunEpoch: now, lastCore: core });
   } else {
     lastGeneratedName = title; // record ownership BEFORE writing so the
     pi.setSessionName(title);  // session_info_changed event isn't mistaken for a user rename
     pi.appendEntry(STATE_ENTRY_TYPE, newState);
     syncBoardName(ctx, title);
   }
-  // Gate-aware outcome (issue #5): soft fallbacks keep their warning and
-  // gate details on BOTH paths; a locked refresh has no gate decision.
-  const outcome = gate
-    ? gateAwareOutcome(changed ? "renamed" : "unchanged", gate, coreRaw)
-    : { reason: changed ? "renamed" : "unchanged", warning: false };
+  const outcome = gateAwareOutcome(changed ? "renamed" : "unchanged", gate, coreRaw);
   return { title, ...outcome };
 }
 
@@ -515,7 +486,7 @@ export default function autoRename(pi: ExtensionAPI): void {
   pi.on("agent_settled", () => trigger(false));
 
   pi.registerCommand("autorename", {
-    description: "Force a rename now (bypasses cooldown, pause, and core lock; re-derives with latest context)",
+    description: "Force a rename now (bypasses cooldown and pause; re-derives from the full conversation)",
     handler: async (_args, ctx) => {
       sessionCtx = ctx;
       const r = await runSerialized(ctx, true);
@@ -554,7 +525,6 @@ export default function autoRename(pi: ExtensionAPI): void {
       const st = readState(ctx.sessionManager.getBranch());
       ctx.ui.notify(
         `auto-rename: title=${st.lastSetTitle ?? "(none)"} core=${st.lastCore ?? "(none)"} ` +
-        `locked=${st.coreLocked ? "yes" : "no"} ` +
         `paused=${st.paused ? st.pausedReason ?? "yes" : "no"} lastRun=${st.lastRunEpoch ? new Date(st.lastRunEpoch * 1000).toLocaleTimeString() : "never"}`,
         "info",
       );
