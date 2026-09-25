@@ -33,7 +33,7 @@
  *   * Best-effort everywhere: never throws into pi's event loop.
  *
  * State lives in the session file as `auto-rename-state` custom entries
- * ({lastRunEpoch, lastSetTitle, lastCore, paused, pausedReason}).
+ * ({lastRunEpoch, lastSetTitle, paused, pausedReason}).
  *
  * Controls:
  *   * ~/.pi/agent/auto-rename.json  {enabled, model, firstAfterMin, repeatEveryMin, maxCoreWidth, debug, lang}
@@ -282,7 +282,6 @@ async function generateCore(rt: LlmRuntime, conversation: string, force = false,
 interface AutoRenameState {
   lastRunEpoch?: number;
   lastSetTitle?: string;
-  lastCore?: string;
   paused?: boolean;
   pausedReason?: string;
 }
@@ -421,10 +420,10 @@ async function runAutoRename(pi: ExtensionAPI, ctx: ExtensionContext, opts: { fo
   const title = composeTitle(core);
 
   // Skip the write when the title did not change, so the name isn't churned.
-  const newState: AutoRenameState = { ...st, lastRunEpoch: now, lastSetTitle: title, lastCore: core, paused: false, pausedReason: undefined };
+  const newState: AutoRenameState = { ...st, lastRunEpoch: now, lastSetTitle: title, paused: false, pausedReason: undefined };
   const changed = title !== st.lastSetTitle;
   if (!changed) {
-    pi.appendEntry(STATE_ENTRY_TYPE, { ...st, lastRunEpoch: now, lastCore: core });
+    pi.appendEntry(STATE_ENTRY_TYPE, { ...st, lastRunEpoch: now });
   } else {
     lastGeneratedName = title; // record ownership BEFORE writing so the
     pi.setSessionName(title);  // session_info_changed event isn't mistaken for a user rename
@@ -524,7 +523,7 @@ export default function autoRename(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       const st = readState(ctx.sessionManager.getBranch());
       ctx.ui.notify(
-        `auto-rename: title=${st.lastSetTitle ?? "(none)"} core=${st.lastCore ?? "(none)"} ` +
+        `auto-rename: title=${st.lastSetTitle ?? "(none)"} ` +
         `paused=${st.paused ? st.pausedReason ?? "yes" : "no"} lastRun=${st.lastRunEpoch ? new Date(st.lastRunEpoch * 1000).toLocaleTimeString() : "never"}`,
         "info",
       );
